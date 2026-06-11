@@ -108,6 +108,8 @@ fun getApiScopes(
 
 ### Use `@ModelAttribute` + DTO for 3+ Parameters or Validation
 
+Variable naming: use `queryReq` for general queries, `searchReq` when search intent is clear.
+
 ```kotlin
 @GetMapping("/students")
 fun getStudentInfo(
@@ -195,7 +197,8 @@ Controller → Service → Repository
 - HTTP request/response handling
 - Input validation (`@Valid`)
 - Route mapping
-- Return DTOs wrapped in `CommonApiResponse`
+- Return DTOs directly — the SDK Wrapper (`ResponseBodyAdvice`) automatically wraps responses in `CommonApiResponse`
+- Use `CommonApiResponse<Nothing>` explicitly only when returning a message with no data (e.g., delete operations)
 
 **Service Responsibilities:**
 - Business logic
@@ -215,14 +218,22 @@ Controller → Service → Repository
 @RestController
 @RequestMapping("/v1/students")
 class StudentController(
-    private val createStudentService: CreateStudentService
+    private val createStudentService: CreateStudentService,
+    private val deleteStudentService: DeleteStudentService,
 ) {
+    // Return DTO directly — SDK Wrapper automatically wraps it in CommonApiResponse
     @PostMapping
     fun createStudent(
         @Valid @RequestBody reqDto: CreateStudentReqDto
-    ): CommonApiResponse<StudentResDto> {
-        val result = createStudentService.execute(reqDto)
-        return CommonApiResponse.success(result)
+    ): StudentResDto = createStudentService.execute(reqDto)
+
+    // Use CommonApiResponse explicitly only when returning a message with no data
+    @DeleteMapping("/{studentId}")
+    fun deleteStudent(
+        @PathVariable studentId: Long,
+    ): CommonApiResponse<Nothing> {
+        deleteStudentService.execute(studentId)
+        return CommonApiResponse.success("Student를 성공적으로 삭제했습니다.")
     }
 }
 
@@ -306,12 +317,17 @@ fun findStudent(id: Long): Student {
 
 ### Type Inference
 
-Use explicit types for public APIs, allow inference for local variables.
+Use explicit types for public APIs, allow inference for local variables. `Unit` return type is omitted by convention.
 
 ```kotlin
 // Public API - explicit types
 interface StudentService {
     fun execute(reqDto: CreateStudentReqDto): StudentResDto
+}
+
+// Unit return type - omit explicitly (convention)
+interface DeleteStudentService {
+    fun execute(studentId: Long)  // NOT `: Unit`
 }
 
 // Local variables - inference allowed
@@ -331,42 +347,30 @@ fun processStudent() {
 
 ## Error Handling
 
-### Custom Exceptions
+### Use ExpectedException Directly
 
-Use `ExpectedException` base class for all custom exceptions.
+For business scenario exceptions (resource not found, duplicate, insufficient permissions, etc.), instantiate `ExpectedException` directly.
+
+Messages must be Korean (합쇼체) ending with a period. Do not include dynamic data (IDs, names, etc.) — messages are displayed directly to end users as toast/alert notifications.
 
 ```kotlin
-class StudentNotFoundException(
-    message: String = "Student not found"
-) : ExpectedException(
-    status = HttpStatus.NOT_FOUND,
-    message = message
-)
+val student =
+    studentRepository.findById(id).orElseThrow {
+        ExpectedException("학생을 찾을 수 없습니다.", HttpStatus.NOT_FOUND)
+    }
 
-class DuplicateStudentException(
-    message: String = "Student already exists"
-) : ExpectedException(
-    status = HttpStatus.CONFLICT,
-    message = message
-)
+if (studentRepository.existsByEmail(email)) {
+    throw ExpectedException("이미 존재하는 이메일입니다.", HttpStatus.CONFLICT)
+}
 ```
+
+Do not create custom exception subclasses extending `ExpectedException`. `ExpectedException` itself is the class for representing scenario-based exceptions; additional wrapping is unnecessary boilerplate.
+
+Other exceptions (e.g., `IOException`, `TimeoutException`) should only be used for situations outside our control, such as external infrastructure failures (AWS S3 outage, network timeout, etc.).
 
 ### Exception Handler
 
-All exceptions are caught by `GlobalExceptionHandler` in `datagsm-common` module.
-
-```kotlin
-@RestControllerAdvice
-class GlobalExceptionHandler {
-    @ExceptionHandler(StudentNotFoundException::class)
-    fun handleStudentNotFound(ex: StudentNotFoundException): CommonApiResponse<Nothing> {
-        return CommonApiResponse.error(
-            status = HttpStatus.NOT_FOUND,
-            message = ex.message
-        )
-    }
-}
-```
+All exceptions are caught by `GlobalExceptionHandler` in a common/shared module.
 
 ## Logging
 
@@ -381,7 +385,7 @@ class StudentService {
     private val logger = LoggerFactory.getLogger(javaClass)
 
     fun execute(reqDto: CreateStudentReqDto): StudentResDto {
-        logger.info("Creating student: {}", reqDto.name)
+        logger.info("Creating student with name {}", reqDto.name)
         // ...
     }
 }
@@ -390,6 +394,23 @@ class StudentService {
 fun execute(reqDto: CreateStudentReqDto) {
     println("Creating student: ${reqDto.name}")  // Never do this
 }
+```
+
+### Log Message Style
+
+- **Language**: English only — verb-led sentences
+- **Format**: SLF4J `{}` placeholder, not string interpolation
+- **Pattern**: `"<Verb> <subject/context> {}"`, value
+
+```kotlin
+// CORRECT
+logger().info("Deleted {} expired API keys", deletedCount)
+logger().error("Failed to issue OAuth token for scopeStr {}", scopeStr)
+logger().warn("ExpectedException occurred with message {}", ex.message)
+
+// WRONG
+logger().error("오류 발생: $message")            // Korean
+logger().error("Error occurred: ${ex.message}") // string interpolation
 ```
 
 ### Log Levels
@@ -416,10 +437,10 @@ class CreateStudentServiceTest : DescribeSpec({
         service = CreateStudentServiceImpl(mockRepository)
     }
 
-    describe("CreateStudentService") {
-        describe("execute") {
-            context("when creating a new student") {
-                it("should save and return the student") {
+    describe("CreateStudentService 클래스의") {
+        describe("execute 메서드는") {
+            context("유효한 요청인 경우") {
+                it("학생을 저장하고 반환한다") {
                     // Given
                     val reqDto = CreateStudentReqDto(
                         name = "John Doe",
@@ -443,8 +464,8 @@ class CreateStudentServiceTest : DescribeSpec({
                 }
             }
 
-            context("when student already exists") {
-                it("should throw DuplicateStudentException") {
+            context("이미 존재하는 이메일인 경우") {
+                it("ExpectedException을 던진다") {
                     // Given
                     val reqDto = CreateStudentReqDto(
                         name = "John Doe",
@@ -454,7 +475,7 @@ class CreateStudentServiceTest : DescribeSpec({
                     every { mockRepository.existsByEmail(reqDto.email) } returns true
 
                     // When & Then
-                    shouldThrow<DuplicateStudentException> {
+                    shouldThrow<ExpectedException> {
                         service.execute(reqDto)
                     }
                 }
@@ -466,10 +487,14 @@ class CreateStudentServiceTest : DescribeSpec({
 
 ### Test Structure
 
-- Use Given-When-Then pattern
+- Use Given-When-Then pattern inside `it` blocks
 - One assertion per test
-- Clear test names in Korean
-- Mock external dependencies
+- Test names in Korean following the pattern:
+  - `describe("ClassName 클래스의")`
+  - `describe("methodName 메서드는")`
+  - `context("상황 설명")` — describe the scenario
+  - `it("기대 동작")` — describe the expected behavior
+- Mock external dependencies with MockK
 - Use `beforeEach` for setup, `afterEach` for cleanup
 
 ## Security
@@ -522,7 +547,7 @@ fun findByName(name: String): List<StudentJpaEntity>
 - WRONG: `@Transactional` on class level → CORRECT: `@Transactional` on method level
 - WRONG: Read operations without `readOnly = true` → CORRECT: `@Transactional(readOnly = true)`
 
-**Apply `@Transactional` at method level, not class level**, for fine-grained control and explicit intent.
+Always apply `@Transactional` at the method level for explicit intent.
 
 ```kotlin
 // CORRECT: Method-level transaction
